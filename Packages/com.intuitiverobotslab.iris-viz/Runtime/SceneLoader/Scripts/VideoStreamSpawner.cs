@@ -2,6 +2,7 @@ using UnityEngine;
 using MessagePack;
 using IRIS.Node;
 using IRIS.Utilities;
+using System.Collections.Generic;
 
 
 
@@ -20,6 +21,9 @@ namespace IRIS.SceneLoader
     public class VideoStreamSpawner : MonoBehaviour
     {
         [SerializeField] private GameObject videoReceiverPrefab;
+        private readonly Dictionary<string, VideoStreamConfig> pendingLeftConfigs = new Dictionary<string, VideoStreamConfig>();
+        private readonly Dictionary<string, VideoStreamConfig> pendingRightConfigs = new Dictionary<string, VideoStreamConfig>();
+
         void Start()
         {
             if (videoReceiverPrefab == null)
@@ -35,10 +39,19 @@ namespace IRIS.SceneLoader
         {
             UnityMainThreadDispatcher.Instance.Enqueue(() =>
             {
+                string stereoBaseName;
+                bool isLeft;
+                if (TryGetStereoBaseName(config.name, out stereoBaseName, out isLeft))
+                {
+                    RegisterStereoConfig(stereoBaseName, config, isLeft);
+                    TrySpawnStereoReceiver(stereoBaseName);
+                    return;
+                }
+
                 GameObject videoStreamObj = Instantiate(videoReceiverPrefab, gameObject.transform);
                 videoStreamObj.name = config.name;
                 VideoStreamReceiver receiver = videoStreamObj.GetComponent<VideoStreamReceiver>();
-                if (receiver != null)                
+                if (receiver != null)
                 {
                     receiver.StartSubscription(config);
                 }
@@ -50,6 +63,15 @@ namespace IRIS.SceneLoader
         {
             UnityMainThreadDispatcher.Instance.Enqueue(() =>
             {
+                string stereoBaseName;
+                bool isLeft;
+                if (TryGetStereoBaseName(videoStreamId, out stereoBaseName, out isLeft))
+                {
+                    pendingLeftConfigs.Remove(stereoBaseName);
+                    pendingRightConfigs.Remove(stereoBaseName);
+                    videoStreamId = stereoBaseName;
+                }
+
                 Transform videoStreamTrans = gameObject.transform.Find(videoStreamId);
                 if (videoStreamTrans != null)
                 {
@@ -57,6 +79,68 @@ namespace IRIS.SceneLoader
                 }
             });
             return ResponseStatus.SUCCESS;
+        }
+
+        private void RegisterStereoConfig(string stereoBaseName, VideoStreamConfig config, bool isLeft)
+        {
+            if (isLeft)
+            {
+                pendingLeftConfigs[stereoBaseName] = config;
+            }
+            else
+            {
+                pendingRightConfigs[stereoBaseName] = config;
+            }
+        }
+
+        private void TrySpawnStereoReceiver(string stereoBaseName)
+        {
+            VideoStreamConfig leftConfig;
+            VideoStreamConfig rightConfig;
+            if (!pendingLeftConfigs.TryGetValue(stereoBaseName, out leftConfig) ||
+                !pendingRightConfigs.TryGetValue(stereoBaseName, out rightConfig))
+            {
+                return;
+            }
+
+            Transform existingReceiver = gameObject.transform.Find(stereoBaseName);
+            if (existingReceiver != null)
+            {
+                VideoStreamReceiver existingVideoReceiver = existingReceiver.GetComponent<VideoStreamReceiver>();
+                if (existingVideoReceiver != null)
+                {
+                    existingVideoReceiver.StartStereoSubscription(leftConfig, rightConfig);
+                }
+                return;
+            }
+
+            GameObject videoStreamObj = Instantiate(videoReceiverPrefab, gameObject.transform);
+            videoStreamObj.name = stereoBaseName;
+            VideoStreamReceiver receiver = videoStreamObj.GetComponent<VideoStreamReceiver>();
+            if (receiver != null)
+            {
+                receiver.StartStereoSubscription(leftConfig, rightConfig);
+            }
+        }
+
+        private bool TryGetStereoBaseName(string streamName, out string stereoBaseName, out bool isLeft)
+        {
+            if (streamName.EndsWith("_left"))
+            {
+                stereoBaseName = streamName.Substring(0, streamName.Length - "_left".Length);
+                isLeft = true;
+                return true;
+            }
+            if (streamName.EndsWith("_right"))
+            {
+                stereoBaseName = streamName.Substring(0, streamName.Length - "_right".Length);
+                isLeft = false;
+                return true;
+            }
+
+            stereoBaseName = streamName;
+            isLeft = false;
+            return false;
         }
     }
 }
