@@ -23,8 +23,10 @@ namespace IRIS.SceneLoader
     {
         public RawImage rawImage;
         private RawImage secondaryRawImage;
-        private Texture2D primaryTexture;
-        private Texture2D secondaryTexture;
+        private Texture2D primaryDisplayTexture;
+        private Texture2D primaryUploadTexture;
+        private Texture2D secondaryDisplayTexture;
+        private Texture2D secondaryUploadTexture;
         private byte[] latestPrimaryImageBytes;
         private byte[] latestSecondaryImageBytes;
         private readonly object primaryFrameLock = new object();
@@ -85,11 +87,28 @@ namespace IRIS.SceneLoader
 
         private void Update()
         {
-            UpdateTexture(primaryTexture, rawImage, ref latestPrimaryImageBytes, primaryFrameLock);
-            if (stereoMode && secondaryRawImage != null && secondaryTexture != null)
+            UpdateTexture(
+                ref primaryDisplayTexture,
+                ref primaryUploadTexture,
+                rawImage,
+                ref latestPrimaryImageBytes,
+                primaryFrameLock
+            );
+            if (stereoMode && secondaryRawImage != null && secondaryDisplayTexture != null && secondaryUploadTexture != null)
             {
-                UpdateTexture(secondaryTexture, secondaryRawImage, ref latestSecondaryImageBytes, secondaryFrameLock);
+                UpdateTexture(
+                    ref secondaryDisplayTexture,
+                    ref secondaryUploadTexture,
+                    secondaryRawImage,
+                    ref latestSecondaryImageBytes,
+                    secondaryFrameLock
+                );
             }
+        }
+
+        public void CloseWindow()
+        {
+            Destroy(gameObject);
         }
 
         private void OnPrimaryFrameReceived(VideoFrame videoFrame)
@@ -130,11 +149,15 @@ namespace IRIS.SceneLoader
 
         private void EnsurePrimaryTexture()
         {
-            if (primaryTexture == null)
+            if (primaryDisplayTexture == null)
             {
-                primaryTexture = new Texture2D(2, 2);
+                primaryDisplayTexture = CreateVideoTexture();
             }
-            rawImage.texture = primaryTexture;
+            if (primaryUploadTexture == null)
+            {
+                primaryUploadTexture = CreateVideoTexture();
+            }
+            rawImage.texture = primaryDisplayTexture;
         }
 
         private void EnsureSecondaryRawImage()
@@ -160,11 +183,15 @@ namespace IRIS.SceneLoader
             secondaryRawImage.rectTransform.localRotation = rawImage.rectTransform.localRotation;
             secondaryRawImage.rectTransform.localScale = rawImage.rectTransform.localScale;
 
-            if (secondaryTexture == null)
+            if (secondaryDisplayTexture == null)
             {
-                secondaryTexture = new Texture2D(2, 2);
+                secondaryDisplayTexture = CreateVideoTexture();
             }
-            secondaryRawImage.texture = secondaryTexture;
+            if (secondaryUploadTexture == null)
+            {
+                secondaryUploadTexture = CreateVideoTexture();
+            }
+            secondaryRawImage.texture = secondaryDisplayTexture;
         }
 
         private void EnsureStereoMaterials()
@@ -188,7 +215,18 @@ namespace IRIS.SceneLoader
             }
         }
 
-        private void UpdateTexture(Texture2D texture, RawImage image, ref byte[] latestImageBytes, object frameLock)
+        private Texture2D CreateVideoTexture()
+        {
+            return new Texture2D(2, 2, TextureFormat.RGBA32, false);
+        }
+
+        private void UpdateTexture(
+            ref Texture2D displayTexture,
+            ref Texture2D uploadTexture,
+            RawImage image,
+            ref byte[] latestImageBytes,
+            object frameLock
+        )
         {
             byte[] imageBytes = null;
             lock (frameLock)
@@ -205,9 +243,12 @@ namespace IRIS.SceneLoader
                 return;
             }
 
-            if (texture.LoadImage(imageBytes, false))
+            if (uploadTexture.LoadImage(imageBytes, false))
             {
-                image.texture = texture;
+                Texture2D previousDisplayTexture = displayTexture;
+                displayTexture = uploadTexture;
+                uploadTexture = previousDisplayTexture;
+                image.texture = displayTexture;
             }
         }
     }
