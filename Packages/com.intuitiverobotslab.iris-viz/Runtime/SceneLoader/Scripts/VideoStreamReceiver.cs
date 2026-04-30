@@ -21,6 +21,8 @@ namespace IRIS.SceneLoader
 
     public class VideoStreamReceiver : MonoBehaviour
     {
+        private const float VideoSurfaceZOffset = -1f;
+
         public RawImage rawImage;
         private RawImage[] primaryRawImages;
         private RawImage[] secondaryRawImages;
@@ -245,11 +247,19 @@ namespace IRIS.SceneLoader
         private void ConfigureRawImage(RawImage image, int index)
         {
             CopyRectTransform(rawImage.rectTransform, image.rectTransform);
+            SetVideoSurfaceDepth(image.rectTransform);
             // Disable transparent mesh culling so alpha changes don't trigger a canvas geometry
             // rebuild (which causes a one-frame gap when the mesh is re-added to the draw call).
             image.canvasRenderer.cullTransparentMesh = false;
             SetRawImageAlpha(image, index == 0 ? 1f : 0f);
             image.transform.SetSiblingIndex(rawImage.transform.GetSiblingIndex() + index);
+        }
+
+        private void SetVideoSurfaceDepth(RectTransform rectTransform)
+        {
+            Vector3 localPosition = rectTransform.localPosition;
+            localPosition.z = rawImage.rectTransform.localPosition.z + VideoSurfaceZOffset;
+            rectTransform.localPosition = localPosition;
         }
 
         private void CopyRectTransform(RectTransform source, RectTransform destination)
