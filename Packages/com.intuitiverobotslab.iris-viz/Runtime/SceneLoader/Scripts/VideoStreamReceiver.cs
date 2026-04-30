@@ -243,7 +243,7 @@ namespace IRIS.SceneLoader
         private void ConfigureRawImage(RawImage image, int index)
         {
             CopyRectTransform(rawImage.rectTransform, image.rectTransform);
-            image.gameObject.SetActive(index == 0);
+            SetRawImageAlpha(image, index == 0 ? 1f : 0f);
             image.transform.SetSiblingIndex(rawImage.transform.GetSiblingIndex() + index);
         }
 
@@ -298,7 +298,7 @@ namespace IRIS.SceneLoader
             {
                 if (eyeRawImages[index] != null)
                 {
-                    eyeRawImages[index].gameObject.SetActive(visible && index == 0);
+                    SetRawImageAlpha(eyeRawImages[index], visible && index == 0 ? 1f : 0f);
                 }
             }
         }
@@ -315,13 +315,25 @@ namespace IRIS.SceneLoader
                 if (eyeRawImages[index] != null)
                 {
                     bool isActive = index == activeIndex;
-                    eyeRawImages[index].gameObject.SetActive(isActive);
+                    SetRawImageAlpha(eyeRawImages[index], isActive ? 1f : 0f);
                     if (isActive)
                     {
                         eyeRawImages[index].transform.SetAsLastSibling();
                     }
                 }
             }
+        }
+
+        private void SetRawImageAlpha(RawImage image, float alpha)
+        {
+            if (image == null)
+            {
+                return;
+            }
+            Color color = image.color;
+            color.a = alpha;
+            image.color = color;
+            image.raycastTarget = alpha > 0f;
         }
 
         private Texture2D CreateVideoTexture()
@@ -355,9 +367,9 @@ namespace IRIS.SceneLoader
             int inactiveEyeRawImageIndex = 1 - activeEyeRawImageIndex;
             if (eyeTextures[inactiveEyeRawImageIndex].LoadImage(imageBytes, false))
             {
-                eyeRawImages[inactiveEyeRawImageIndex].gameObject.SetActive(true);
+                SetRawImageAlpha(eyeRawImages[inactiveEyeRawImageIndex], 1f);
                 eyeRawImages[inactiveEyeRawImageIndex].transform.SetAsLastSibling();
-                eyeRawImages[activeEyeRawImageIndex].gameObject.SetActive(false);
+                SetRawImageAlpha(eyeRawImages[activeEyeRawImageIndex], 0f);
                 activeEyeRawImageIndex = inactiveEyeRawImageIndex;
             }
         }
