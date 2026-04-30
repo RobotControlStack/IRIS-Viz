@@ -22,11 +22,12 @@ namespace IRIS.SceneLoader
     public class VideoStreamReceiver : MonoBehaviour
     {
         public RawImage rawImage;
-        private RawImage secondaryRawImage;
-        private Texture2D primaryDisplayTexture;
-        private Texture2D primaryUploadTexture;
-        private Texture2D secondaryDisplayTexture;
-        private Texture2D secondaryUploadTexture;
+        private RawImage[] primaryRawImages;
+        private RawImage[] secondaryRawImages;
+        private int activePrimaryRawImageIndex;
+        private int activeSecondaryRawImageIndex;
+        private Texture2D[] primaryTextures;
+        private Texture2D[] secondaryTextures;
         private byte[] latestPrimaryImageBytes;
         private byte[] latestSecondaryImageBytes;
         private readonly object primaryFrameLock = new object();
@@ -39,7 +40,7 @@ namespace IRIS.SceneLoader
 
         private void Start()
         {
-            EnsurePrimaryTexture();
+            EnsurePrimaryRawImages();
         }
 
         public void StartSubscription(VideoStreamConfig config)
@@ -47,14 +48,11 @@ namespace IRIS.SceneLoader
             CleanupSubscriptions();
             stereoMode = false;
             primaryTopic = config.name;
-            EnsurePrimaryTexture();
-            if (secondaryRawImage != null)
-            {
-                secondaryRawImage.gameObject.SetActive(false);
-            }
-            rawImage.material = null;
+            EnsurePrimaryRawImages();
+            SetEyeVisible(secondaryRawImages, false);
+            SetEyeMaterial(primaryRawImages, null);
             IRISXRNode.Instance.SubscriberManager.RegisterSubscriptionCallback<VideoFrame>(config.name, OnPrimaryFrameReceived, config.url);
-            rawImage.rectTransform.sizeDelta = new Vector2(config.width, config.height);
+            SetEyeSize(primaryRawImages, config.width, config.height);
         }
 
         public void StartStereoSubscription(VideoStreamConfig leftConfig, VideoStreamConfig rightConfig)
@@ -63,15 +61,15 @@ namespace IRIS.SceneLoader
             stereoMode = true;
             primaryTopic = leftConfig.name;
             secondaryTopic = rightConfig.name;
-            EnsurePrimaryTexture();
-            EnsureSecondaryRawImage();
+            EnsurePrimaryRawImages();
+            EnsureSecondaryRawImages();
             EnsureStereoMaterials();
 
-            rawImage.rectTransform.sizeDelta = new Vector2(leftConfig.width, leftConfig.height);
-            secondaryRawImage.rectTransform.sizeDelta = new Vector2(rightConfig.width, rightConfig.height);
-            rawImage.material = leftEyeMaterial;
-            secondaryRawImage.material = rightEyeMaterial;
-            secondaryRawImage.gameObject.SetActive(true);
+            SetEyeSize(primaryRawImages, leftConfig.width, leftConfig.height);
+            SetEyeSize(secondaryRawImages, rightConfig.width, rightConfig.height);
+            SetEyeMaterial(primaryRawImages, leftEyeMaterial);
+            SetEyeMaterial(secondaryRawImages, rightEyeMaterial);
+            SetEyeVisible(secondaryRawImages, true);
 
             IRISXRNode.Instance.SubscriberManager.RegisterSubscriptionCallback<VideoFrame>(
                 leftConfig.name,
@@ -88,18 +86,18 @@ namespace IRIS.SceneLoader
         private void Update()
         {
             UpdateTexture(
-                ref primaryDisplayTexture,
-                ref primaryUploadTexture,
-                rawImage,
+                primaryRawImages,
+                primaryTextures,
+                ref activePrimaryRawImageIndex,
                 ref latestPrimaryImageBytes,
                 primaryFrameLock
             );
-            if (stereoMode && secondaryRawImage != null && secondaryDisplayTexture != null && secondaryUploadTexture != null)
+            if (stereoMode && secondaryRawImages != null && secondaryTextures != null)
             {
                 UpdateTexture(
-                    ref secondaryDisplayTexture,
-                    ref secondaryUploadTexture,
-                    secondaryRawImage,
+                    secondaryRawImages,
+                    secondaryTextures,
+                    ref activeSecondaryRawImageIndex,
                     ref latestSecondaryImageBytes,
                     secondaryFrameLock
                 );
@@ -108,6 +106,11 @@ namespace IRIS.SceneLoader
 
         public void CloseWindow()
         {
+            VideoStreamSpawner spawner = GetComponentInParent<VideoStreamSpawner>();
+            if (spawner != null)
+            {
+                spawner.DismissVideoReceiver(gameObject.name);
+            }
             Destroy(gameObject);
         }
 
@@ -147,51 +150,17 @@ namespace IRIS.SceneLoader
             stereoMode = false;
         }
 
-        private void EnsurePrimaryTexture()
+        private void EnsurePrimaryRawImages()
         {
-            if (primaryDisplayTexture == null)
-            {
-                primaryDisplayTexture = CreateVideoTexture();
-            }
-            if (primaryUploadTexture == null)
-            {
-                primaryUploadTexture = CreateVideoTexture();
-            }
-            rawImage.texture = primaryDisplayTexture;
+            EnsureEyeBuffers(ref primaryRawImages, ref primaryTextures, rawImage);
+            SetActiveEyeBuffer(primaryRawImages, ref activePrimaryRawImageIndex, 0);
         }
 
-        private void EnsureSecondaryRawImage()
+        private void EnsureSecondaryRawImages()
         {
-            if (secondaryRawImage == null)
-            {
-                GameObject secondaryRawImageObject = Instantiate(rawImage.gameObject, rawImage.transform.parent);
-                secondaryRawImageObject.name = rawImage.gameObject.name + "_RightEye";
-                secondaryRawImage = secondaryRawImageObject.GetComponent<RawImage>();
-
-                TMP_Text[] labels = secondaryRawImageObject.GetComponentsInChildren<TMP_Text>(true);
-                for (int index = 0; index < labels.Length; index++)
-                {
-                    labels[index].gameObject.SetActive(false);
-                }
-            }
-
-            secondaryRawImage.transform.SetSiblingIndex(rawImage.transform.GetSiblingIndex() + 1);
-            secondaryRawImage.rectTransform.anchorMin = rawImage.rectTransform.anchorMin;
-            secondaryRawImage.rectTransform.anchorMax = rawImage.rectTransform.anchorMax;
-            secondaryRawImage.rectTransform.pivot = rawImage.rectTransform.pivot;
-            secondaryRawImage.rectTransform.anchoredPosition = rawImage.rectTransform.anchoredPosition;
-            secondaryRawImage.rectTransform.localRotation = rawImage.rectTransform.localRotation;
-            secondaryRawImage.rectTransform.localScale = rawImage.rectTransform.localScale;
-
-            if (secondaryDisplayTexture == null)
-            {
-                secondaryDisplayTexture = CreateVideoTexture();
-            }
-            if (secondaryUploadTexture == null)
-            {
-                secondaryUploadTexture = CreateVideoTexture();
-            }
-            secondaryRawImage.texture = secondaryDisplayTexture;
+            RawImage secondaryTemplate = GetSecondaryTemplateRawImage();
+            EnsureEyeBuffers(ref secondaryRawImages, ref secondaryTextures, secondaryTemplate);
+            SetActiveEyeBuffer(secondaryRawImages, ref activeSecondaryRawImageIndex, 0);
         }
 
         private void EnsureStereoMaterials()
@@ -215,15 +184,155 @@ namespace IRIS.SceneLoader
             }
         }
 
+        private RawImage GetSecondaryTemplateRawImage()
+        {
+            if (secondaryRawImages != null && secondaryRawImages.Length > 0 && secondaryRawImages[0] != null)
+            {
+                return secondaryRawImages[0];
+            }
+
+            EnsurePrimaryRawImages();
+            GameObject secondaryRawImageObject = Instantiate(primaryRawImages[0].gameObject, primaryRawImages[0].transform.parent);
+            secondaryRawImageObject.name = rawImage.gameObject.name + "_RightEye";
+            RawImage secondaryTemplate = secondaryRawImageObject.GetComponent<RawImage>();
+            TMP_Text[] labels = secondaryRawImageObject.GetComponentsInChildren<TMP_Text>(true);
+            for (int index = 0; index < labels.Length; index++)
+            {
+                labels[index].gameObject.SetActive(false);
+            }
+            CopyRectTransform(rawImage.rectTransform, secondaryTemplate.rectTransform);
+            return secondaryTemplate;
+        }
+
+        private void EnsureEyeBuffers(ref RawImage[] eyeRawImages, ref Texture2D[] eyeTextures, RawImage template)
+        {
+            if (eyeRawImages == null)
+            {
+                eyeRawImages = new RawImage[2];
+            }
+            if (eyeTextures == null)
+            {
+                eyeTextures = new Texture2D[2];
+            }
+
+            if (eyeRawImages[0] == null)
+            {
+                eyeRawImages[0] = template;
+            }
+            ConfigureRawImage(eyeRawImages[0], 0);
+
+            for (int index = 0; index < 2; index++)
+            {
+                if (eyeTextures[index] == null)
+                {
+                    eyeTextures[index] = CreateVideoTexture();
+                }
+
+                if (eyeRawImages[index] == null)
+                {
+                    GameObject eyeObject = Instantiate(template.gameObject, template.transform.parent);
+                    eyeObject.name = template.gameObject.name + "_Buffer" + index;
+                    eyeRawImages[index] = eyeObject.GetComponent<RawImage>();
+                }
+
+                ConfigureRawImage(eyeRawImages[index], index);
+                eyeRawImages[index].texture = eyeTextures[index];
+            }
+        }
+
+        private void ConfigureRawImage(RawImage image, int index)
+        {
+            CopyRectTransform(rawImage.rectTransform, image.rectTransform);
+            image.gameObject.SetActive(index == 0);
+            image.transform.SetSiblingIndex(rawImage.transform.GetSiblingIndex() + index);
+        }
+
+        private void CopyRectTransform(RectTransform source, RectTransform destination)
+        {
+            destination.anchorMin = source.anchorMin;
+            destination.anchorMax = source.anchorMax;
+            destination.pivot = source.pivot;
+            destination.anchoredPosition = source.anchoredPosition;
+            destination.sizeDelta = source.sizeDelta;
+            destination.localRotation = source.localRotation;
+            destination.localScale = source.localScale;
+        }
+
+        private void SetEyeSize(RawImage[] eyeRawImages, int width, int height)
+        {
+            if (eyeRawImages == null)
+            {
+                return;
+            }
+            for (int index = 0; index < eyeRawImages.Length; index++)
+            {
+                if (eyeRawImages[index] != null)
+                {
+                    eyeRawImages[index].rectTransform.sizeDelta = new Vector2(width, height);
+                }
+            }
+        }
+
+        private void SetEyeMaterial(RawImage[] eyeRawImages, Material material)
+        {
+            if (eyeRawImages == null)
+            {
+                return;
+            }
+            for (int index = 0; index < eyeRawImages.Length; index++)
+            {
+                if (eyeRawImages[index] != null)
+                {
+                    eyeRawImages[index].material = material;
+                }
+            }
+        }
+
+        private void SetEyeVisible(RawImage[] eyeRawImages, bool visible)
+        {
+            if (eyeRawImages == null)
+            {
+                return;
+            }
+            for (int index = 0; index < eyeRawImages.Length; index++)
+            {
+                if (eyeRawImages[index] != null)
+                {
+                    eyeRawImages[index].gameObject.SetActive(visible && index == 0);
+                }
+            }
+        }
+
+        private void SetActiveEyeBuffer(RawImage[] eyeRawImages, ref int activeIndex, int newActiveIndex)
+        {
+            if (eyeRawImages == null)
+            {
+                return;
+            }
+            activeIndex = newActiveIndex;
+            for (int index = 0; index < eyeRawImages.Length; index++)
+            {
+                if (eyeRawImages[index] != null)
+                {
+                    bool isActive = index == activeIndex;
+                    eyeRawImages[index].gameObject.SetActive(isActive);
+                    if (isActive)
+                    {
+                        eyeRawImages[index].transform.SetAsLastSibling();
+                    }
+                }
+            }
+        }
+
         private Texture2D CreateVideoTexture()
         {
             return new Texture2D(2, 2, TextureFormat.RGBA32, false);
         }
 
         private void UpdateTexture(
-            ref Texture2D displayTexture,
-            ref Texture2D uploadTexture,
-            RawImage image,
+            RawImage[] eyeRawImages,
+            Texture2D[] eyeTextures,
+            ref int activeEyeRawImageIndex,
             ref byte[] latestImageBytes,
             object frameLock
         )
@@ -243,12 +352,13 @@ namespace IRIS.SceneLoader
                 return;
             }
 
-            if (uploadTexture.LoadImage(imageBytes, false))
+            int inactiveEyeRawImageIndex = 1 - activeEyeRawImageIndex;
+            if (eyeTextures[inactiveEyeRawImageIndex].LoadImage(imageBytes, false))
             {
-                Texture2D previousDisplayTexture = displayTexture;
-                displayTexture = uploadTexture;
-                uploadTexture = previousDisplayTexture;
-                image.texture = displayTexture;
+                eyeRawImages[inactiveEyeRawImageIndex].gameObject.SetActive(true);
+                eyeRawImages[inactiveEyeRawImageIndex].transform.SetAsLastSibling();
+                eyeRawImages[activeEyeRawImageIndex].gameObject.SetActive(false);
+                activeEyeRawImageIndex = inactiveEyeRawImageIndex;
             }
         }
     }

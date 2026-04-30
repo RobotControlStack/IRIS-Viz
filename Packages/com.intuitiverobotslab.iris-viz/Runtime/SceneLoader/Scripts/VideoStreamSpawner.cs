@@ -23,6 +23,7 @@ namespace IRIS.SceneLoader
         [SerializeField] private GameObject videoReceiverPrefab;
         private readonly Dictionary<string, VideoStreamConfig> pendingLeftConfigs = new Dictionary<string, VideoStreamConfig>();
         private readonly Dictionary<string, VideoStreamConfig> pendingRightConfigs = new Dictionary<string, VideoStreamConfig>();
+        private readonly HashSet<string> dismissedReceivers = new HashSet<string>();
 
         void Start()
         {
@@ -43,8 +44,23 @@ namespace IRIS.SceneLoader
                 bool isLeft;
                 if (TryGetStereoBaseName(config.name, out stereoBaseName, out isLeft))
                 {
+                    if (dismissedReceivers.Contains(stereoBaseName))
+                    {
+                        return;
+                    }
                     RegisterStereoConfig(stereoBaseName, config, isLeft);
                     TrySpawnStereoReceiver(stereoBaseName);
+                    return;
+                }
+
+                if (dismissedReceivers.Contains(config.name))
+                {
+                    return;
+                }
+
+                Transform existingReceiver = gameObject.transform.Find(config.name);
+                if (existingReceiver != null)
+                {
                     return;
                 }
 
@@ -69,7 +85,12 @@ namespace IRIS.SceneLoader
                 {
                     pendingLeftConfigs.Remove(stereoBaseName);
                     pendingRightConfigs.Remove(stereoBaseName);
+                    dismissedReceivers.Remove(stereoBaseName);
                     videoStreamId = stereoBaseName;
+                }
+                else
+                {
+                    dismissedReceivers.Remove(videoStreamId);
                 }
 
                 Transform videoStreamTrans = gameObject.transform.Find(videoStreamId);
@@ -79,6 +100,21 @@ namespace IRIS.SceneLoader
                 }
             });
             return ResponseStatus.SUCCESS;
+        }
+
+        public void DismissVideoReceiver(string videoStreamId)
+        {
+            string stereoBaseName;
+            bool isLeft;
+            if (TryGetStereoBaseName(videoStreamId, out stereoBaseName, out isLeft))
+            {
+                dismissedReceivers.Add(stereoBaseName);
+                pendingLeftConfigs.Remove(stereoBaseName);
+                pendingRightConfigs.Remove(stereoBaseName);
+                return;
+            }
+
+            dismissedReceivers.Add(videoStreamId);
         }
 
         private void RegisterStereoConfig(string stereoBaseName, VideoStreamConfig config, bool isLeft)
@@ -106,11 +142,6 @@ namespace IRIS.SceneLoader
             Transform existingReceiver = gameObject.transform.Find(stereoBaseName);
             if (existingReceiver != null)
             {
-                VideoStreamReceiver existingVideoReceiver = existingReceiver.GetComponent<VideoStreamReceiver>();
-                if (existingVideoReceiver != null)
-                {
-                    existingVideoReceiver.StartStereoSubscription(leftConfig, rightConfig);
-                }
                 return;
             }
 
