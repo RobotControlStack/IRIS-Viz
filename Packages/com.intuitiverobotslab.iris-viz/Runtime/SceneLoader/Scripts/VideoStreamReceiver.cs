@@ -106,7 +106,9 @@ namespace IRIS.SceneLoader
 
         public void CloseWindow()
         {
-            VideoStreamSpawner spawner = GetComponentInParent<VideoStreamSpawner>();
+            // VideoStreamSpawner lives on a scene object unrelated to VideoRender's hierarchy,
+            // so GetComponentInParent returns null. Use FindObjectOfType to locate it.
+            VideoStreamSpawner spawner = FindObjectOfType<VideoStreamSpawner>();
             if (spawner != null)
             {
                 spawner.DismissVideoReceiver(gameObject.name);
@@ -243,6 +245,9 @@ namespace IRIS.SceneLoader
         private void ConfigureRawImage(RawImage image, int index)
         {
             CopyRectTransform(rawImage.rectTransform, image.rectTransform);
+            // Disable transparent mesh culling so alpha changes don't trigger a canvas geometry
+            // rebuild (which causes a one-frame gap when the mesh is re-added to the draw call).
+            image.canvasRenderer.cullTransparentMesh = false;
             SetRawImageAlpha(image, index == 0 ? 1f : 0f);
             image.transform.SetSiblingIndex(rawImage.transform.GetSiblingIndex() + index);
         }
@@ -338,7 +343,15 @@ namespace IRIS.SceneLoader
 
         private Texture2D CreateVideoTexture()
         {
-            return new Texture2D(2, 2, TextureFormat.RGBA32, false);
+            // Use RGB24 to match JPEG output format, avoiding format+size change on first LoadImage
+            // which would recreate the native GPU texture and cause a one-frame black flash.
+            var tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
+            tex.SetPixels32(new Color32[] {
+                new Color32(0, 0, 0, 255), new Color32(0, 0, 0, 255),
+                new Color32(0, 0, 0, 255), new Color32(0, 0, 0, 255)
+            });
+            tex.Apply();
+            return tex;
         }
 
         private void UpdateTexture(
@@ -367,8 +380,10 @@ namespace IRIS.SceneLoader
             int inactiveEyeRawImageIndex = 1 - activeEyeRawImageIndex;
             if (eyeTextures[inactiveEyeRawImageIndex].LoadImage(imageBytes, false))
             {
-                SetRawImageAlpha(eyeRawImages[inactiveEyeRawImageIndex], 1f);
+                // Move to front while still invisible, then show — avoids the brief state
+                // where the new buffer is alpha=1 but still behind the window background.
                 eyeRawImages[inactiveEyeRawImageIndex].transform.SetAsLastSibling();
+                SetRawImageAlpha(eyeRawImages[inactiveEyeRawImageIndex], 1f);
                 SetRawImageAlpha(eyeRawImages[activeEyeRawImageIndex], 0f);
                 activeEyeRawImageIndex = inactiveEyeRawImageIndex;
             }
