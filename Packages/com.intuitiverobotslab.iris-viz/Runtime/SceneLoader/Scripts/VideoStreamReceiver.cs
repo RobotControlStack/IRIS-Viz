@@ -1,10 +1,9 @@
 
-
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.UI;
 using IRIS.Node;
 using MessagePack;
-using TMPro;
 
 namespace IRIS.SceneLoader
 {
@@ -22,14 +21,25 @@ namespace IRIS.SceneLoader
     public class VideoStreamReceiver : MonoBehaviour
     {
         private const float VideoSurfaceZOffset = -1f;
+        private const string LeftStereoLayerName = "IRISStereoLeft";
+        private const string RightStereoLayerName = "IRISStereoRight";
+        private const string UniversalRenderPipelineUnlitShader = "Universal Render Pipeline/Unlit";
+        private const string LegacyUnlitTextureShader = "Unlit/Texture";
+
+        private sealed class StereoQuadSurface
+        {
+            public GameObject root;
+            public MeshRenderer[] renderers;
+            public Texture2D[] textures;
+            public int activeRendererIndex;
+        }
 
         public RawImage rawImage;
-        private RawImage[] primaryRawImages;
-        private RawImage[] secondaryRawImages;
-        private int activePrimaryRawImageIndex;
-        private int activeSecondaryRawImageIndex;
-        private Texture2D[] primaryTextures;
-        private Texture2D[] secondaryTextures;
+        private RawImage[] monoRawImages;
+        private int activeMonoRawImageIndex;
+        private Texture2D[] monoTextures;
+        private StereoQuadSurface leftStereoSurface;
+        private StereoQuadSurface rightStereoSurface;
         private byte[] latestPrimaryImageBytes;
         private byte[] latestSecondaryImageBytes;
         private readonly object primaryFrameLock = new object();
@@ -37,12 +47,10 @@ namespace IRIS.SceneLoader
         private string primaryTopic;
         private string secondaryTopic;
         private bool stereoMode;
-        private static Material leftEyeMaterial;
-        private static Material rightEyeMaterial;
 
         private void Start()
         {
-            EnsurePrimaryRawImages();
+            EnsureMonoBuffers();
         }
 
         public void StartSubscription(VideoStreamConfig config)
@@ -50,11 +58,12 @@ namespace IRIS.SceneLoader
             CleanupSubscriptions();
             stereoMode = false;
             primaryTopic = config.name;
-            EnsurePrimaryRawImages();
-            SetEyeVisible(secondaryRawImages, false);
-            SetEyeMaterial(primaryRawImages, null);
+            EnsureMonoBuffers();
+            ConfigureMonoBuffers(config.width, config.height);
+            SetActiveMonoBuffer(0);
+            SetStereoSurfaceVisible(leftStereoSurface, false);
+            SetStereoSurfaceVisible(rightStereoSurface, false);
             IRISXRNode.Instance.SubscriberManager.RegisterSubscriptionCallback<VideoFrame>(config.name, OnPrimaryFrameReceived, config.url);
-            SetEyeSize(primaryRawImages, config.width, config.height);
         }
 
         public void StartStereoSubscription(VideoStreamConfig leftConfig, VideoStreamConfig rightConfig)
@@ -63,15 +72,21 @@ namespace IRIS.SceneLoader
             stereoMode = true;
             primaryTopic = leftConfig.name;
             secondaryTopic = rightConfig.name;
-            EnsurePrimaryRawImages();
-            EnsureSecondaryRawImages();
-            EnsureStereoMaterials();
+            EnsureMonoBuffers();
+            SetMonoBuffersVisible(false);
+            bool leftSurfaceReady = EnsureStereoSurface(ref leftStereoSurface, LeftStereoLayerName, "Left");
+            bool rightSurfaceReady = EnsureStereoSurface(ref rightStereoSurface, RightStereoLayerName, "Right");
+            if (!leftSurfaceReady || !rightSurfaceReady)
+            {
+                stereoMode = false;
+                SetMonoBuffersVisible(true);
+                return;
+            }
 
-            SetEyeSize(primaryRawImages, leftConfig.width, leftConfig.height);
-            SetEyeSize(secondaryRawImages, rightConfig.width, rightConfig.height);
-            SetEyeMaterial(primaryRawImages, leftEyeMaterial);
-            SetEyeMaterial(secondaryRawImages, rightEyeMaterial);
-            SetEyeVisible(secondaryRawImages, true);
+            ConfigureStereoSurface(leftStereoSurface, leftConfig.width, leftConfig.height);
+            ConfigureStereoSurface(rightStereoSurface, rightConfig.width, rightConfig.height);
+            SetStereoSurfaceVisible(leftStereoSurface, true);
+            SetStereoSurfaceVisible(rightStereoSurface, true);
 
             IRISXRNode.Instance.SubscriberManager.RegisterSubscriptionCallback<VideoFrame>(
                 leftConfig.name,
@@ -87,23 +102,14 @@ namespace IRIS.SceneLoader
 
         private void Update()
         {
-            UpdateTexture(
-                primaryRawImages,
-                primaryTextures,
-                ref activePrimaryRawImageIndex,
-                ref latestPrimaryImageBytes,
-                primaryFrameLock
-            );
-            if (stereoMode && secondaryRawImages != null && secondaryTextures != null)
+            if (stereoMode)
             {
-                UpdateTexture(
-                    secondaryRawImages,
-                    secondaryTextures,
-                    ref activeSecondaryRawImageIndex,
-                    ref latestSecondaryImageBytes,
-                    secondaryFrameLock
-                );
+                UpdateStereoSurface(leftStereoSurface, ref latestPrimaryImageBytes, primaryFrameLock);
+                UpdateStereoSurface(rightStereoSurface, ref latestSecondaryImageBytes, secondaryFrameLock);
+                return;
             }
+
+            UpdateMonoBuffers(ref latestPrimaryImageBytes, primaryFrameLock);
         }
 
         public void CloseWindow()
@@ -151,108 +157,369 @@ namespace IRIS.SceneLoader
             }
             primaryTopic = null;
             secondaryTopic = null;
+            latestPrimaryImageBytes = null;
+            latestSecondaryImageBytes = null;
             stereoMode = false;
         }
 
-        private void EnsurePrimaryRawImages()
+        private void EnsureMonoBuffers()
         {
-            EnsureEyeBuffers(ref primaryRawImages, ref primaryTextures, rawImage);
-            SetActiveEyeBuffer(primaryRawImages, ref activePrimaryRawImageIndex, 0);
-        }
-
-        private void EnsureSecondaryRawImages()
-        {
-            RawImage secondaryTemplate = GetSecondaryTemplateRawImage();
-            EnsureEyeBuffers(ref secondaryRawImages, ref secondaryTextures, secondaryTemplate);
-            SetActiveEyeBuffer(secondaryRawImages, ref activeSecondaryRawImageIndex, 0);
-        }
-
-        private void EnsureStereoMaterials()
-        {
-            Shader stereoEyeShader = Shader.Find("IRIS/UI/StereoEyeMask");
-            if (stereoEyeShader == null)
+            if (monoRawImages == null)
             {
-                Debug.LogError("Could not find IRIS/UI/StereoEyeMask shader.");
-                return;
+                monoRawImages = new RawImage[2];
+            }
+            if (monoTextures == null)
+            {
+                monoTextures = new Texture2D[2];
             }
 
-            if (leftEyeMaterial == null)
+            if (monoRawImages[0] == null)
             {
-                leftEyeMaterial = new Material(stereoEyeShader);
-                leftEyeMaterial.SetFloat("_EyeIndex", 0f);
-            }
-            if (rightEyeMaterial == null)
-            {
-                rightEyeMaterial = new Material(stereoEyeShader);
-                rightEyeMaterial.SetFloat("_EyeIndex", 1f);
-            }
-        }
-
-        private RawImage GetSecondaryTemplateRawImage()
-        {
-            if (secondaryRawImages != null && secondaryRawImages.Length > 0 && secondaryRawImages[0] != null)
-            {
-                return secondaryRawImages[0];
+                monoRawImages[0] = rawImage;
             }
 
-            EnsurePrimaryRawImages();
-            GameObject secondaryRawImageObject = Instantiate(primaryRawImages[0].gameObject, primaryRawImages[0].transform.parent);
-            secondaryRawImageObject.name = rawImage.gameObject.name + "_RightEye";
-            RawImage secondaryTemplate = secondaryRawImageObject.GetComponent<RawImage>();
-            TMP_Text[] labels = secondaryRawImageObject.GetComponentsInChildren<TMP_Text>(true);
-            for (int index = 0; index < labels.Length; index++)
+            for (int index = 0; index < monoRawImages.Length; index++)
             {
-                labels[index].gameObject.SetActive(false);
-            }
-            CopyRectTransform(rawImage.rectTransform, secondaryTemplate.rectTransform);
-            return secondaryTemplate;
-        }
-
-        private void EnsureEyeBuffers(ref RawImage[] eyeRawImages, ref Texture2D[] eyeTextures, RawImage template)
-        {
-            if (eyeRawImages == null)
-            {
-                eyeRawImages = new RawImage[2];
-            }
-            if (eyeTextures == null)
-            {
-                eyeTextures = new Texture2D[2];
-            }
-
-            if (eyeRawImages[0] == null)
-            {
-                eyeRawImages[0] = template;
-            }
-            ConfigureRawImage(eyeRawImages[0], 0);
-
-            for (int index = 0; index < 2; index++)
-            {
-                if (eyeTextures[index] == null)
+                if (monoTextures[index] == null)
                 {
-                    eyeTextures[index] = CreateVideoTexture();
+                    monoTextures[index] = CreateVideoTexture();
                 }
 
-                if (eyeRawImages[index] == null)
+                if (monoRawImages[index] == null)
                 {
-                    GameObject eyeObject = Instantiate(template.gameObject, template.transform.parent);
-                    eyeObject.name = template.gameObject.name + "_Buffer" + index;
-                    eyeRawImages[index] = eyeObject.GetComponent<RawImage>();
+                    GameObject eyeObject = Instantiate(rawImage.gameObject, rawImage.transform.parent);
+                    eyeObject.name = rawImage.gameObject.name + "_Buffer" + index;
+                    monoRawImages[index] = eyeObject.GetComponent<RawImage>();
                 }
 
-                ConfigureRawImage(eyeRawImages[index], index);
-                eyeRawImages[index].texture = eyeTextures[index];
+                ConfigureMonoRawImage(monoRawImages[index], monoTextures[index], index);
             }
         }
 
-        private void ConfigureRawImage(RawImage image, int index)
+        private void ConfigureMonoRawImage(RawImage image, Texture2D texture, int index)
         {
             CopyRectTransform(rawImage.rectTransform, image.rectTransform);
             SetVideoSurfaceDepth(image.rectTransform);
-            // Disable transparent mesh culling so alpha changes don't trigger a canvas geometry
-            // rebuild (which causes a one-frame gap when the mesh is re-added to the draw call).
             image.canvasRenderer.cullTransparentMesh = false;
-            SetRawImageAlpha(image, index == 0 ? 1f : 0f);
+            image.texture = texture;
+            image.material = null;
             image.transform.SetSiblingIndex(rawImage.transform.GetSiblingIndex() + index);
+        }
+
+        private void ConfigureMonoBuffers(int width, int height)
+        {
+            if (monoRawImages == null)
+            {
+                return;
+            }
+
+            for (int index = 0; index < monoRawImages.Length; index++)
+            {
+                if (monoRawImages[index] != null)
+                {
+                    monoRawImages[index].rectTransform.sizeDelta = new Vector2(width, height);
+                }
+            }
+        }
+
+        private void UpdateMonoBuffers(ref byte[] latestImageBytes, object frameLock)
+        {
+            byte[] imageBytes = null;
+            lock (frameLock)
+            {
+                if (latestImageBytes != null)
+                {
+                    imageBytes = latestImageBytes;
+                    latestImageBytes = null;
+                }
+            }
+
+            if (imageBytes == null)
+            {
+                return;
+            }
+
+            int inactiveMonoRawImageIndex = 1 - activeMonoRawImageIndex;
+            if (monoTextures[inactiveMonoRawImageIndex].LoadImage(imageBytes, false))
+            {
+                monoRawImages[inactiveMonoRawImageIndex].transform.SetAsLastSibling();
+                SetRawImageAlpha(monoRawImages[inactiveMonoRawImageIndex], 1f);
+                SetRawImageAlpha(monoRawImages[activeMonoRawImageIndex], 0f);
+                activeMonoRawImageIndex = inactiveMonoRawImageIndex;
+            }
+        }
+
+        private void SetActiveMonoBuffer(int newActiveIndex)
+        {
+            activeMonoRawImageIndex = newActiveIndex;
+            if (monoRawImages == null)
+            {
+                return;
+            }
+
+            for (int index = 0; index < monoRawImages.Length; index++)
+            {
+                if (monoRawImages[index] == null)
+                {
+                    continue;
+                }
+
+                bool isActive = index == activeMonoRawImageIndex;
+                SetRawImageAlpha(monoRawImages[index], isActive ? 1f : 0f);
+                if (isActive)
+                {
+                    monoRawImages[index].transform.SetAsLastSibling();
+                }
+            }
+        }
+
+        private void SetMonoBuffersVisible(bool visible)
+        {
+            if (monoRawImages == null)
+            {
+                return;
+            }
+
+            for (int index = 0; index < monoRawImages.Length; index++)
+            {
+                if (monoRawImages[index] != null)
+                {
+                    bool shouldShow = visible && index == activeMonoRawImageIndex;
+                    SetRawImageAlpha(monoRawImages[index], shouldShow ? 1f : 0f);
+                }
+            }
+        }
+
+        private bool EnsureStereoSurface(ref StereoQuadSurface surface, string layerName, string eyeName)
+        {
+            if (surface == null)
+            {
+                surface = new StereoQuadSurface
+                {
+                    root = new GameObject(rawImage.gameObject.name + "_" + eyeName + "StereoSurface"),
+                    renderers = new MeshRenderer[2],
+                    textures = new Texture2D[2],
+                    activeRendererIndex = 0,
+                };
+                surface.root.transform.SetParent(rawImage.transform, false);
+            }
+
+            int layerIndex = LayerMask.NameToLayer(layerName);
+            if (layerIndex < 0)
+            {
+                Debug.LogError($"Missing stereo layer '{layerName}'. Quest scene must define it before stereo video can render correctly.");
+                SetStereoSurfaceVisible(surface, false);
+                return false;
+            }
+
+            SetLayerRecursively(surface.root, layerIndex);
+            ConfigureStereoRootTransform(surface.root.transform);
+
+            for (int index = 0; index < surface.renderers.Length; index++)
+            {
+                if (surface.textures[index] == null)
+                {
+                    surface.textures[index] = CreateVideoTexture();
+                }
+
+                if (surface.renderers[index] == null)
+                {
+                    GameObject quad = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                    quad.name = surface.root.name + "_Buffer" + index;
+                    quad.transform.SetParent(surface.root.transform, false);
+                    Collider quadCollider = quad.GetComponent<Collider>();
+                    if (quadCollider != null)
+                    {
+                        Destroy(quadCollider);
+                    }
+                    surface.renderers[index] = quad.GetComponent<MeshRenderer>();
+                }
+
+                ConfigureStereoRenderer(surface.renderers[index], surface.textures[index], layerIndex);
+            }
+
+            return true;
+        }
+
+        private void ConfigureStereoRootTransform(Transform transformRoot)
+        {
+            transformRoot.localPosition = new Vector3(0f, 0f, VideoSurfaceZOffset);
+            transformRoot.localRotation = Quaternion.identity;
+            transformRoot.localScale = Vector3.one;
+        }
+
+        private void ConfigureStereoSurface(StereoQuadSurface surface, int width, int height)
+        {
+            if (surface == null)
+            {
+                return;
+            }
+
+            for (int index = 0; index < surface.renderers.Length; index++)
+            {
+                if (surface.renderers[index] != null)
+                {
+                    Transform rendererTransform = surface.renderers[index].transform;
+                    rendererTransform.localPosition = Vector3.zero;
+                    rendererTransform.localRotation = Quaternion.identity;
+                    rendererTransform.localScale = new Vector3(width, height, 1f);
+                }
+            }
+
+            SetActiveStereoRenderer(surface, 0);
+        }
+
+        private void ConfigureStereoRenderer(MeshRenderer renderer, Texture2D texture, int layerIndex)
+        {
+            GameObject rendererObject = renderer.gameObject;
+            rendererObject.layer = layerIndex;
+            renderer.shadowCastingMode = ShadowCastingMode.Off;
+            renderer.receiveShadows = false;
+            renderer.lightProbeUsage = LightProbeUsage.Off;
+            renderer.reflectionProbeUsage = ReflectionProbeUsage.Off;
+            renderer.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
+
+            Material material = renderer.sharedMaterial;
+            if (!IsStereoSurfaceMaterial(material))
+            {
+                material = CreateStereoMaterial(texture);
+                renderer.sharedMaterial = material;
+            }
+            else
+            {
+                AssignStereoTexture(material, texture);
+                if (material.HasProperty("_Cull"))
+                {
+                    material.SetInt("_Cull", (int)CullMode.Off);
+                }
+            }
+        }
+
+        private bool IsStereoSurfaceMaterial(Material material)
+        {
+            if (material == null || material.shader == null)
+            {
+                return false;
+            }
+
+            return material.shader.name == UniversalRenderPipelineUnlitShader
+                || material.shader.name == LegacyUnlitTextureShader;
+        }
+
+        private Material CreateStereoMaterial(Texture2D texture)
+        {
+            Shader shader = Shader.Find(UniversalRenderPipelineUnlitShader);
+            if (shader == null)
+            {
+                shader = Shader.Find(LegacyUnlitTextureShader);
+            }
+            if (shader == null)
+            {
+                Debug.LogError("Could not find a supported unlit shader for stereo video surfaces.");
+                return null;
+            }
+
+            Material material = new Material(shader);
+            if (material.HasProperty("_BaseColor"))
+            {
+                material.SetColor("_BaseColor", Color.white);
+            }
+            if (material.HasProperty("_Color"))
+            {
+                material.SetColor("_Color", Color.white);
+            }
+            if (material.HasProperty("_Cull"))
+            {
+                material.SetInt("_Cull", (int)CullMode.Off);
+            }
+            AssignStereoTexture(material, texture);
+            return material;
+        }
+
+        private void AssignStereoTexture(Material material, Texture2D texture)
+        {
+            if (material == null)
+            {
+                return;
+            }
+
+            material.mainTexture = texture;
+            if (material.HasProperty("_BaseMap"))
+            {
+                material.SetTexture("_BaseMap", texture);
+            }
+            if (material.HasProperty("_MainTex"))
+            {
+                material.SetTexture("_MainTex", texture);
+            }
+        }
+
+        private void SetStereoSurfaceVisible(StereoQuadSurface surface, bool visible)
+        {
+            if (surface == null || surface.renderers == null)
+            {
+                return;
+            }
+
+            for (int index = 0; index < surface.renderers.Length; index++)
+            {
+                if (surface.renderers[index] != null)
+                {
+                    surface.renderers[index].enabled = visible && index == surface.activeRendererIndex;
+                }
+            }
+        }
+
+        private void SetActiveStereoRenderer(StereoQuadSurface surface, int newActiveIndex)
+        {
+            if (surface == null || surface.renderers == null)
+            {
+                return;
+            }
+
+            surface.activeRendererIndex = newActiveIndex;
+            for (int index = 0; index < surface.renderers.Length; index++)
+            {
+                if (surface.renderers[index] != null)
+                {
+                    surface.renderers[index].enabled = index == surface.activeRendererIndex;
+                }
+            }
+        }
+
+        private void UpdateStereoSurface(StereoQuadSurface surface, ref byte[] latestImageBytes, object frameLock)
+        {
+            if (surface == null || surface.textures == null || surface.renderers == null)
+            {
+                return;
+            }
+
+            byte[] imageBytes = null;
+            lock (frameLock)
+            {
+                if (latestImageBytes != null)
+                {
+                    imageBytes = latestImageBytes;
+                    latestImageBytes = null;
+                }
+            }
+
+            if (imageBytes == null)
+            {
+                return;
+            }
+
+            int inactiveRendererIndex = 1 - surface.activeRendererIndex;
+            if (surface.textures[inactiveRendererIndex].LoadImage(imageBytes, false))
+            {
+                if (surface.renderers[inactiveRendererIndex].sharedMaterial != null)
+                {
+                    AssignStereoTexture(surface.renderers[inactiveRendererIndex].sharedMaterial, surface.textures[inactiveRendererIndex]);
+                }
+                surface.renderers[inactiveRendererIndex].enabled = true;
+                surface.renderers[surface.activeRendererIndex].enabled = false;
+                surface.activeRendererIndex = inactiveRendererIndex;
+            }
         }
 
         private void SetVideoSurfaceDepth(RectTransform rectTransform)
@@ -273,72 +540,6 @@ namespace IRIS.SceneLoader
             destination.localScale = source.localScale;
         }
 
-        private void SetEyeSize(RawImage[] eyeRawImages, int width, int height)
-        {
-            if (eyeRawImages == null)
-            {
-                return;
-            }
-            for (int index = 0; index < eyeRawImages.Length; index++)
-            {
-                if (eyeRawImages[index] != null)
-                {
-                    eyeRawImages[index].rectTransform.sizeDelta = new Vector2(width, height);
-                }
-            }
-        }
-
-        private void SetEyeMaterial(RawImage[] eyeRawImages, Material material)
-        {
-            if (eyeRawImages == null)
-            {
-                return;
-            }
-            for (int index = 0; index < eyeRawImages.Length; index++)
-            {
-                if (eyeRawImages[index] != null)
-                {
-                    eyeRawImages[index].material = material;
-                }
-            }
-        }
-
-        private void SetEyeVisible(RawImage[] eyeRawImages, bool visible)
-        {
-            if (eyeRawImages == null)
-            {
-                return;
-            }
-            for (int index = 0; index < eyeRawImages.Length; index++)
-            {
-                if (eyeRawImages[index] != null)
-                {
-                    SetRawImageAlpha(eyeRawImages[index], visible && index == 0 ? 1f : 0f);
-                }
-            }
-        }
-
-        private void SetActiveEyeBuffer(RawImage[] eyeRawImages, ref int activeIndex, int newActiveIndex)
-        {
-            if (eyeRawImages == null)
-            {
-                return;
-            }
-            activeIndex = newActiveIndex;
-            for (int index = 0; index < eyeRawImages.Length; index++)
-            {
-                if (eyeRawImages[index] != null)
-                {
-                    bool isActive = index == activeIndex;
-                    SetRawImageAlpha(eyeRawImages[index], isActive ? 1f : 0f);
-                    if (isActive)
-                    {
-                        eyeRawImages[index].transform.SetAsLastSibling();
-                    }
-                }
-            }
-        }
-
         private void SetRawImageAlpha(RawImage image, float alpha)
         {
             if (image == null)
@@ -353,8 +554,6 @@ namespace IRIS.SceneLoader
 
         private Texture2D CreateVideoTexture()
         {
-            // Use RGB24 to match JPEG output format, avoiding format+size change on first LoadImage
-            // which would recreate the native GPU texture and cause a one-frame black flash.
             var tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
             tex.SetPixels32(new Color32[] {
                 new Color32(0, 0, 0, 255), new Color32(0, 0, 0, 255),
@@ -364,38 +563,17 @@ namespace IRIS.SceneLoader
             return tex;
         }
 
-        private void UpdateTexture(
-            RawImage[] eyeRawImages,
-            Texture2D[] eyeTextures,
-            ref int activeEyeRawImageIndex,
-            ref byte[] latestImageBytes,
-            object frameLock
-        )
+        private void SetLayerRecursively(GameObject target, int layerIndex)
         {
-            byte[] imageBytes = null;
-            lock (frameLock)
-            {
-                if (latestImageBytes != null)
-                {
-                    imageBytes = latestImageBytes;
-                    latestImageBytes = null;
-                }
-            }
-
-            if (imageBytes == null)
+            if (target == null)
             {
                 return;
             }
 
-            int inactiveEyeRawImageIndex = 1 - activeEyeRawImageIndex;
-            if (eyeTextures[inactiveEyeRawImageIndex].LoadImage(imageBytes, false))
+            target.layer = layerIndex;
+            foreach (Transform child in target.transform)
             {
-                // Move to front while still invisible, then show — avoids the brief state
-                // where the new buffer is alpha=1 but still behind the window background.
-                eyeRawImages[inactiveEyeRawImageIndex].transform.SetAsLastSibling();
-                SetRawImageAlpha(eyeRawImages[inactiveEyeRawImageIndex], 1f);
-                SetRawImageAlpha(eyeRawImages[activeEyeRawImageIndex], 0f);
-                activeEyeRawImageIndex = inactiveEyeRawImageIndex;
+                SetLayerRecursively(child.gameObject, layerIndex);
             }
         }
     }
